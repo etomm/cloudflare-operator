@@ -39,7 +39,28 @@ import (
 
 const (
 	FinalizerName = "dnsrecord.networking.cloudflare-operator.io/finalizer"
+
+	// driftCheckInterval is how often an active DNSRecord is re-synced to
+	// detect records deleted out-of-band in Cloudflare.
+	driftCheckInterval = time.Hour
+
+	// eventReasonSharedRecordRetained is emitted when a deleted DNSRecord
+	// leaves the Cloudflare record in place because other owners remain.
+	eventReasonSharedRecordRetained = "SharedRecordRetained"
+
+	// eventReasonRecordRecreated is emitted when the managed record was
+	// removed out-of-band and had to be recreated.
+	eventReasonRecordRecreated = "RecordRecreated"
 )
+
+// dnsRecordAPI is the subset of Cloudflare DNS operations used by this
+// controller. It allows the record lifecycle to be tested in isolation.
+type dnsRecordAPI interface {
+	GetDNSRecordIDInZone(ctx context.Context, zoneID, fqdn, recordType string) (string, error)
+	CreateDNSRecordInZone(ctx context.Context, zoneID string, params cf.DNSRecordParams) (*cf.DNSRecordResult, error)
+	UpdateDNSRecordInZone(ctx context.Context, zoneID, recordID string, params cf.DNSRecordParams) (*cf.DNSRecordResult, error)
+	DeleteDNSRecordInZone(ctx context.Context, zoneID, recordID string) error
+}
 
 // DNSRecordReconciler reconciles a DNSRecord object.
 // It directly calls Cloudflare API and writes status back to CRD,
@@ -361,8 +382,6 @@ func (r *DNSRecordReconciler) setOrphanedStatus(
 }
 
 // syncDNSRecord syncs the DNS record to Cloudflare.
-//
-//nolint:revive // cognitive complexity acceptable for sync logic
 func (r *DNSRecordReconciler) syncDNSRecord(
 	ctx context.Context,
 	dnsRecord *networkingv1alpha2.DNSRecord,
@@ -370,8 +389,20 @@ func (r *DNSRecordReconciler) syncDNSRecord(
 	apiResult *common.APIClientResult,
 	resolvedInfo *resolvedContentInfo,
 ) (ctrl.Result, error) {
+	return r.syncWithAPI(ctx, dnsRecord, zoneInfo.ZoneID, apiResult.API, resolvedInfo)
+}
+
+// syncWithAPI syncs the DNS record to Cloudflare using the given API client.
+//
+//nolint:revive // cognitive complexity acceptable for sync logic
+func (r *DNSRecordReconciler) syncWithAPI(
+	ctx context.Context,
+	dnsRecord *networkingv1alpha2.DNSRecord,
+	zoneID string,
+	api dnsRecordAPI,
+	resolvedInfo *resolvedContentInfo,
+) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	api := apiResult.API
 
 	// Determine content and type
 	var content, recordType string
@@ -417,17 +448,19 @@ func (r *DNSRecordReconciler) syncDNSRecord(
 			"recordId", dnsRecord.Status.RecordID,
 			"name", params.Name,
 			"type", params.Type)
-		result, err = api.UpdateDNSRecordInZone(ctx, zoneInfo.ZoneID, dnsRecord.Status.RecordID, params)
-		if err != nil {
-			if cf.IsNotFoundError(err) {
-				// Record was deleted externally, create new one
-				logger.Info("Record not found, creating new one")
-				result, err = api.CreateDNSRecordInZone(ctx, zoneInfo.ZoneID, params)
-			}
+		result, err = api.UpdateDNSRecordInZone(ctx, zoneID, dnsRecord.Status.RecordID, params)
+		if err != nil && cf.IsNotFoundError(err) {
+			// Record was deleted externally, create new one
+			logger.Info("Record not found, creating new one",
+				"recordId", dnsRecord.Status.RecordID,
+				"name", params.Name)
+			r.Recorder.Event(dnsRecord, corev1.EventTypeNormal, eventReasonRecordRecreated,
+				fmt.Sprintf("DNS record %s was removed from Cloudflare, recreating it", dnsRecord.Status.RecordID))
+			result, err = r.createOrAdoptDNSRecord(ctx, zoneID, params, api)
 		}
 	} else {
 		// Check if record already exists (adoption scenario)
-		existingID, lookupErr := api.GetDNSRecordIDInZone(ctx, zoneInfo.ZoneID, dnsRecord.Spec.Name, recordType)
+		existingID, lookupErr := api.GetDNSRecordIDInZone(ctx, zoneID, dnsRecord.Spec.Name, recordType)
 		if lookupErr != nil && !cf.IsNotFoundError(lookupErr) {
 			logger.Error(lookupErr, "Failed to check for existing DNS record")
 			return r.setErrorStatus(ctx, dnsRecord, lookupErr)
@@ -436,11 +469,17 @@ func (r *DNSRecordReconciler) syncDNSRecord(
 		if existingID != "" {
 			// Adopt existing record
 			logger.Info("Adopting existing DNS record", "recordId", existingID)
-			result, err = api.UpdateDNSRecordInZone(ctx, zoneInfo.ZoneID, existingID, params)
+			result, err = api.UpdateDNSRecordInZone(ctx, zoneID, existingID, params)
+			if err != nil && cf.IsNotFoundError(err) {
+				// Record disappeared between lookup and update
+				logger.Info("Existing DNS record disappeared before adoption, creating new one",
+					"recordId", existingID, "name", params.Name)
+				result, err = r.createOrAdoptDNSRecord(ctx, zoneID, params, api)
+			}
 		} else {
 			// Create new record
 			logger.Info("Creating DNS record", "name", params.Name, "type", params.Type)
-			result, err = api.CreateDNSRecordInZone(ctx, zoneInfo.ZoneID, params)
+			result, err = r.createOrAdoptDNSRecord(ctx, zoneID, params, api)
 		}
 	}
 
@@ -452,7 +491,40 @@ func (r *DNSRecordReconciler) syncDNSRecord(
 	}
 
 	// Update status with result
-	return r.setSuccessStatus(ctx, dnsRecord, zoneInfo.ZoneID, result, resolvedInfo)
+	return r.setSuccessStatus(ctx, dnsRecord, zoneID, result, resolvedInfo)
+}
+
+// createOrAdoptDNSRecord creates a DNS record, adopting an existing record with
+// the same name and type if another DNSRecord created it concurrently.
+// Cloudflare rejects the duplicate with error 81053 ("An A, AAAA, or CNAME
+// record with that host already exists"), which is a normal race when several
+// resources declare the same hostname.
+func (r *DNSRecordReconciler) createOrAdoptDNSRecord(
+	ctx context.Context,
+	zoneID string,
+	params cf.DNSRecordParams,
+	api dnsRecordAPI,
+) (*cf.DNSRecordResult, error) {
+	logger := log.FromContext(ctx)
+
+	result, err := api.CreateDNSRecordInZone(ctx, zoneID, params)
+	if err == nil {
+		return result, nil
+	}
+	if !cf.IsConflictError(err) {
+		return nil, err
+	}
+
+	logger.Info("DNS record already exists in Cloudflare, adopting it",
+		"name", params.Name, "type", params.Type)
+	existingID, lookupErr := api.GetDNSRecordIDInZone(ctx, zoneID, params.Name, params.Type)
+	if lookupErr != nil {
+		return nil, errors.Join(err, lookupErr)
+	}
+	if existingID == "" {
+		return nil, err
+	}
+	return api.UpdateDNSRecordInZone(ctx, zoneID, existingID, params)
 }
 
 // forceRemoveFinalizer removes the finalizer when external resources are unavailable.
@@ -483,8 +555,6 @@ func (r *DNSRecordReconciler) forceRemoveFinalizer(
 }
 
 // handleDeletion handles the deletion of a DNSRecord.
-//
-//nolint:revive // cognitive complexity is acceptable for deletion handling
 func (r *DNSRecordReconciler) handleDeletion(
 	ctx context.Context,
 	dnsRecord *networkingv1alpha2.DNSRecord,
@@ -496,25 +566,66 @@ func (r *DNSRecordReconciler) handleDeletion(
 		return ctrl.Result{}, nil
 	}
 
-	// Delete DNS record from Cloudflare
+	var api dnsRecordAPI
 	if dnsRecord.Status.RecordID != "" && zoneInfo.ZoneID != "" {
 		apiResult, err := r.getAPIClient(ctx, dnsRecord, zoneInfo)
 		if err != nil {
 			logger.Error(err, "Failed to get API client for deletion")
 			// Continue with finalizer removal - record might not exist anyway
 		} else {
-			if err := apiResult.API.DeleteDNSRecordInZone(ctx, zoneInfo.ZoneID, dnsRecord.Status.RecordID); err != nil {
-				if !cf.IsNotFoundError(err) {
-					logger.Error(err, "Failed to delete DNS record from Cloudflare, continuing with finalizer removal")
-					r.Recorder.Event(dnsRecord, corev1.EventTypeWarning, controller.EventReasonDeleteFailed,
-						fmt.Sprintf("Failed to delete from Cloudflare (will remove finalizer anyway): %s", cf.SanitizeErrorMessage(err)))
-					// Don't block finalizer removal - resource may need manual cleanup in Cloudflare
-				}
-				// Record already deleted or deletion failed, continue with finalizer removal
-			} else {
-				r.Recorder.Event(dnsRecord, corev1.EventTypeNormal, controller.EventReasonDeleted,
-					fmt.Sprintf("Deleted DNS record %s from Cloudflare", dnsRecord.Status.RecordID))
+			api = apiResult.API
+		}
+	}
+
+	return r.handleDeletionWithAPI(ctx, dnsRecord, zoneInfo.ZoneID, api)
+}
+
+// handleDeletionWithAPI deletes the Cloudflare record (if this resource is its
+// last owner) and removes the finalizer.
+//
+//nolint:revive // cognitive complexity is acceptable for deletion handling
+func (r *DNSRecordReconciler) handleDeletionWithAPI(
+	ctx context.Context,
+	dnsRecord *networkingv1alpha2.DNSRecord,
+	zoneID string,
+	api dnsRecordAPI,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(dnsRecord, FinalizerName) {
+		return ctrl.Result{}, nil
+	}
+
+	// Delete DNS record from Cloudflare, but only if no other DNSRecord still
+	// manages the same record. Several Ingresses may declare the same host and
+	// all of their DNSRecords adopt the same Cloudflare record ID; deleting the
+	// record for one of them would break all the others.
+	if dnsRecord.Status.RecordID != "" && zoneID != "" && api != nil {
+		shared, err := r.hasOtherLiveOwner(ctx, dnsRecord)
+		if err != nil {
+			logger.Error(err, "Failed to check for other DNSRecord owners, postponing record deletion",
+				"recordId", dnsRecord.Status.RecordID)
+			return ctrl.Result{}, err
+		}
+
+		if shared {
+			logger.Info("Retaining shared DNS record, other DNSRecords still manage this FQDN",
+				"recordId", dnsRecord.Status.RecordID,
+				"name", dnsRecord.Spec.Name)
+			r.Recorder.Event(dnsRecord, corev1.EventTypeNormal, eventReasonSharedRecordRetained,
+				fmt.Sprintf("DNS record %s for %s is still managed by other DNSRecords; leaving it in Cloudflare",
+					dnsRecord.Status.RecordID, dnsRecord.Spec.Name))
+		} else if err := api.DeleteDNSRecordInZone(ctx, zoneID, dnsRecord.Status.RecordID); err != nil {
+			if !cf.IsNotFoundError(err) {
+				logger.Error(err, "Failed to delete DNS record from Cloudflare, continuing with finalizer removal")
+				r.Recorder.Event(dnsRecord, corev1.EventTypeWarning, controller.EventReasonDeleteFailed,
+					fmt.Sprintf("Failed to delete from Cloudflare (will remove finalizer anyway): %s", cf.SanitizeErrorMessage(err)))
+				// Don't block finalizer removal - resource may need manual cleanup in Cloudflare
 			}
+			// Record already deleted or deletion failed, continue with finalizer removal
+		} else {
+			r.Recorder.Event(dnsRecord, corev1.EventTypeNormal, controller.EventReasonDeleted,
+				fmt.Sprintf("Deleted DNS record %s from Cloudflare", dnsRecord.Status.RecordID))
 		}
 	}
 
@@ -577,7 +688,9 @@ func (r *DNSRecordReconciler) setSuccessStatus(
 	r.Recorder.Event(dnsRecord, corev1.EventTypeNormal, controller.EventReasonSynced,
 		fmt.Sprintf("DNS record %s synced to Cloudflare (ID: %s)", dnsRecord.Spec.Name, result.ID))
 
-	return ctrl.Result{}, nil
+	// Periodically reconcile active records so that a record deleted
+	// out-of-band in Cloudflare is detected and recreated.
+	return ctrl.Result{RequeueAfter: driftCheckInterval}, nil
 }
 
 // setErrorStatus updates the DNS record status to indicate an error.
